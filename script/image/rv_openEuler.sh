@@ -92,19 +92,14 @@ log_info "rootfs UUID: $ROOT_UUID"
 log_info "esp UUID: $ESP_UUID"
 
 sudo mkdir -p "$ESP_MOUNT/EFI/BOOT" "$ESP_MOUNT/EFI/openEuler"
-sudo cp "$SHIM" "$ESP_MOUNT/EFI/openEuler/shimriscv64.efi"
-# OVMF/EDK2 fallback looks for \EFI\BOOT\BOOTRISCV64.EFI.
-# Keep both cases to avoid FAT filename/case matching issues.
 sudo cp "$SHIM" "$ESP_MOUNT/EFI/BOOT/BOOTRISCV64.EFI"
-sudo cp "$SHIM" "$ESP_MOUNT/EFI/BOOT/BOOTRISCV64.efi"
+sudo cp "$SHIM" "$ESP_MOUNT/EFI/openEuler/shimriscv64.efi"
 sudo cp "$MMX" "$ESP_MOUNT/EFI/openEuler/mmriscv64.efi"
 sudo cp "$BOOTRISCV64_CSV" "$ESP_MOUNT/EFI/openEuler/BOOTRISCV64.CSV"
 
-# Ensure UEFI fallback file exists before we start long docker install.
-sudo ls -l "$ESP_MOUNT/EFI/BOOT/BOOTRISCV64.EFI" "$ESP_MOUNT/EFI/BOOT/BOOTRISCV64.efi" >/dev/null
 
 log_title "Install OpenEuler RISC-V rootfs via Docker"
-docker pull hub.oepkgs.net/openeuler/openeuler:24.03-lts
+# docker pull hub.oepkgs.net/openeuler/openeuler:24.03-lts
 sudo docker run --privileged --rm \
   -e "ROOT_UUID=$ROOT_UUID" \
   -e "ESP_UUID=$ESP_UUID" \
@@ -114,12 +109,11 @@ sudo docker run --privileged --rm \
 set -e
 
 dnf install -y util-linux > /dev/null
-mkdir -p /mnt/rootfs/{dev,proc,sys,run,var/log}
 
+mkdir -p /mnt/rootfs/{dev,proc,sys,run,var/log}
 if ! grep -q " /mnt/rootfs/dev " /proc/mounts 2>/dev/null; then
   mount --bind /dev /mnt/rootfs/dev
 fi
-
 if [ ! -e /mnt/rootfs/proc/meminfo ]; then
   mount -t proc proc /mnt/rootfs/proc
 fi
@@ -147,6 +141,7 @@ sysfs             /sys            sysfs   defaults                   0       0
 devtmpfs          /dev            devtmpfs defaults                  0       0
 tmpfs             /run            tmpfs   defaults                   0       0
 EOF
+
 echo "openeuler-riscv" > /mnt/rootfs/etc/hostname
 cat > /mnt/rootfs/etc/hosts <<EOF
 127.0.0.1   localhost
@@ -155,6 +150,7 @@ cat > /mnt/rootfs/etc/hosts <<EOF
 ff02::1     ip6-allnodes
 ff02::2     ip6-allrouters
 EOF
+
 sed -i 's|^root:[^:]*:|root::|' /mnt/rootfs/etc/shadow
 mkdir -p /mnt/rootfs/boot/grub2 /mnt/rootfs/boot/efi
 INNER
@@ -187,14 +183,18 @@ sudo grub-mkimage \
   minicmd boot chain reboot halt gzio fdt
 
 log_title "Generate QEMU virt DTB"
-# dumpdtb causes QEMU to write the DTB and exit immediately on recent versions;
-# timeout 10 guards against older QEMU builds that might not exit automatically.
-timeout 10 qemu-system-riscv64 \
-  -machine virt,dumpdtb=/tmp/riscv-virt.dtb \
-  -display none -m 256M -nographic 2>/dev/null || true
-[ -f /tmp/riscv-virt.dtb ] || log_error "Failed to generate DTB"
-sudo cp /tmp/riscv-virt.dtb "$ROOT_MOUNT/boot/riscv-virt.dtb"
-log_info "DTB saved to rootfs /boot/"
+# -bios none: skip firmware so dumpdtb runs before any init failure.
+TEMP_DTB="/tmp/riscv-virt-dtb-$$.dtb"
+command -v qemu-system-riscv64 >/dev/null 2>&1 || log_error "qemu-system-riscv64 not in PATH"
+timeout 30 qemu-system-riscv64 \
+  -bios none \
+  -machine "virt,dumpdtb=${TEMP_DTB}" \
+  -display none -m 256M -nographic || true
+[[ -f "$TEMP_DTB" && -s "$TEMP_DTB" ]] || log_error "Failed to generate DTB"
+sudo cp "$TEMP_DTB" "$ROOT_MOUNT/boot/riscv-virt.dtb"
+
+rm -f "$TEMP_DTB"
+log_info "DTB saved to rootfs $ROOT_MOUNT/boot/riscv-virt.dtb"
 
 KERNEL_VER=$(ls "$ROOT_MOUNT"/boot/vmlinuz-* 2>/dev/null | head -1 | sed 's|.*/vmlinuz-||')
 [ -n "$KERNEL_VER" ] || log_error "no kernel found in rootfs"
@@ -217,13 +217,14 @@ if ! command -v sbsign > /dev/null; then
   sudo apt-get update
   sudo apt-get install -y sbsigntool
 fi
-sudo cp "$SHIM" "$ESP_MOUNT/EFI/BOOT/BOOTRISCV64.EFI"
-sudo cp "$SHIM" "$ESP_MOUNT/EFI/openEuler/shimriscv64.efi"
+
 sbverify --cert "$DB_CERT" "$ESP_MOUNT/EFI/BOOT/BOOTRISCV64.EFI"
+
 GRUB_EFI="$ESP_MOUNT/EFI/openEuler/grubriscv64.efi"
 [ -f "$GRUB_EFI" ] || log_error "grubriscv64.efi not found"
 sbsign --key "$VENDOR_PRIV_KEY" --cert "$VENDOR_CERT" --output "$GRUB_EFI" "$GRUB_EFI"
 sbverify --cert "$VENDOR_CERT" "$GRUB_EFI"
+
 sudo cp "$GRUB_EFI" "$ESP_MOUNT/EFI/BOOT/grubriscv64.efi"
 
 log_title "Check ESP files"

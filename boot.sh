@@ -24,6 +24,7 @@ log_error(){
     local line func file
     read line func file <<< "$(caller 0)"
     printf "${COLOR_ERROR}[ERROR] [%s:%d] %s${COLOR_RESET}\n" "$file" "$line" "$*" >&2
+    usage
     exit
 }
 log_blank(){
@@ -85,10 +86,6 @@ SECURE_BOOT=""
 
 while true; do
     case "$1" in 
-        -v|--verbose)
-            VERBOSE=1
-            shift
-            ;;
         -h|--help)
             usage
             ;;
@@ -119,37 +116,22 @@ while true; do
     esac
 done
 
-# Store Position Args
-TARGET="$@"
-
 # Check Args Validity
-error_flag=0
 if [ -z "$ARCH" ]; then
     log_error "必须指定架构：-a|--arch=<rv,x86>"
-    error_flag=1
 elif [[ "$ARCH" != "rv" && "$ARCH" != "x86" ]]; then
     log_error "ARCH 必须为 'rv' 或 'x86'"
-    error_flag=1
 fi
 
 if [ -z "$KERNEL" ]; then
     log_error "必须指定内核：-k|--kernel=<openEuler,ubuntu>"
-    error_flag=1
 elif [[ "$KERNEL" != "openEuler" && "$KERNEL" != "ubuntu" ]]; then
     log_error "KERNEL 必须为 'openEuler' 或 'ubuntu'"
-    error_flag=1
 fi
 
 if [[ $SECURE_BOOT != "secureboot" && $SECURE_BOOT != "unsecureboot" ]]; then
     log_error "必须指定是否开启安全启动：--secureboot | --unsecureboot"
-    error_flag=1
 fi
-
-if [[ error_flag -ne 0 ]]; then
-    log_blank
-    usage
-fi
-
 
 # ======  Compose Qemu Command  ====== #
 BaseCommand=(sudo -S)
@@ -181,56 +163,9 @@ BaseCommand+=(-netdev user,id=net0,net=192.168.17.0/24)
 
 CODE=${OVMF_CODE[$ARCH:$SECURE_BOOT]}
 VARS=${OVMF_VARS[$ARCH:$SECURE_BOOT]}
-VARS_RUNTIME=$(mktemp /tmp/ovmf_vars_XXXXXX.fd)
-
-cp "$VARS" "$VARS_RUNTIME"
-VARS_SAVED="/tmp/rv_ovmf_vars_last.fd"
-# Keep a copy after QEMU exits so we can inspect what BootOrder OVMF wrote back.
-trap '[[ "$ARCH" = "rv" ]] && cp "$VARS_RUNTIME" "$VARS_SAVED" 2>/dev/null; rm -f "$VARS_RUNTIME"' EXIT
-
-# OVMF's RiscVVirt platform code dynamically creates Boot0000 "UEFI Misc Device"
-# pointing at VenHw(837DCA9E...) on every boot.  In QEMU 10.x that device no
-# longer supports direct booting, so BDS fails before reaching the ESP fallback.
-# Fix: inject an explicit FilePath boot entry pointing at \EFI\BOOT\BOOTRISCV64.EFI
-# *before* QEMU starts.  OVMF finds Boot0000 already set, uses it, and BDS scans
-# all file systems to expand the short-form path and load the shim.
-if [[ "$ARCH" = "rv" ]] && command -v virt-fw-vars >/dev/null 2>&1; then
-  del_args=()
-  for i in {0..31}; do
-    del_args+=(--delete "$(printf 'Boot%04X' $i)")
-  done
-  virt-fw-vars --inplace "$VARS_RUNTIME" \
-    "${del_args[@]}" --delete BootOrder --delete BootNext \
-    >/dev/null 2>&1 || true
-
-  # Create Boot0000 = FilePath(BOOTRISCV64.EFI) + BootOrder=[0000]
-  virt-fw-vars --inplace "$VARS_RUNTIME" \
-    --append-boot-filepath '\\EFI\\BOOT\\BOOTRISCV64.EFI' \
-    >/dev/null 2>&1
-
-  # Set BootNext=0x0000 so BDS tries Boot0000 BEFORE BootOrder, even if
-  # OVMF's PlatformBootManagerLib overwrites BootOrder at runtime.
-  # BootNext is a one-shot variable: cleared by firmware after one use.
-  _bootjson=$(mktemp /tmp/bootnext_XXXXXX.json)
-  cat > "$_bootjson" <<'JSON'
-{
-    "version": 2,
-    "variables": [
-        {
-            "name": "BootNext",
-            "guid": "8be4df61-93ca-11d2-aa0d-00e098032b8c",
-            "attr": 7,
-            "data": "0000"
-        }
-    ]
-}
-JSON
-  virt-fw-vars --inplace "$VARS_RUNTIME" --set-json "$_bootjson" >/dev/null 2>&1 || true
-  rm -f "$_bootjson"
-fi
 
 BaseCommand+=(-blockdev node-name=pflash0,driver=file,read-only=on,filename=$CODE)
-BaseCommand+=(-blockdev node-name=pflash1,driver=file,filename=$VARS_RUNTIME)
+BaseCommand+=(-blockdev node-name=pflash1,driver=file,filename=$VARS)
 
 DISK=${DISK_IMAGE[$ARCH:$KERNEL]}
 if [[ $ARCH = "x86" ]]; then
@@ -241,4 +176,3 @@ fi
 
 # ======  Run Qemu  ====== #
 "${BaseCommand[@]}"
-# echo ${BaseCommand[@]}
